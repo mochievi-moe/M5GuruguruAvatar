@@ -1,10 +1,12 @@
 #include "M5GuruguruAvatar.h"
 #include <math.h>
 
+// ── original 9-dir mode ──────────────────────────────────────────
 bool M5GuruguruAvatar::init(int imgWidth, int imgHeight) {
   _imgWidth   = imgWidth;
   _imgHeight  = imgHeight;
   _currentDir = AVATAR_CENTER_DIR;
+  _mode       = Mode::Touch9;
 
   if (!LittleFS.begin(true)) {
     Serial.println("[Avatar] LittleFS mount failed");
@@ -28,7 +30,7 @@ bool M5GuruguruAvatar::init(int imgWidth, int imgHeight) {
   }
 
   _running = true;
-  xTaskCreatePinnedToCore(drawTask, "AvatarDraw", 4096, this, 1, &_taskHandle, 1);
+  xTaskCreatePinnedToCore(drawTask9, "AvatarDraw9", 4096, this, 1, &_taskHandle, 1);
   return true;
 }
 
@@ -36,6 +38,90 @@ void M5GuruguruAvatar::trackFace(int touchX, int touchY) {
   _currentDir = getDirection(touchX, touchY);
 }
 
+// ── new grid25 mode (sensor-bus driven, with blink) ──────────────
+bool M5GuruguruAvatar::initGrid(int imgWidth, int imgHeight) {
+  _imgWidth     = imgWidth;
+  _imgHeight    = imgHeight;
+  _currentRow   = AVATAR_GRID_CENTER_ROW;
+  _currentCol   = AVATAR_GRID_CENTER_COL;
+  _blink        = false;
+  _mode         = Mode::Grid25;
+
+  if (!LittleFS.begin(true)) {
+    Serial.println("[Avatar] LittleFS mount failed");
+    return false;
+  }
+
+  Serial.printf("[Avatar] initGrid: loading 50 sprites (PSRAM free=%d)\n", ESP.getFreePsram());
+
+  int loaded = 0;
+  for (int r = 0; r < AVATAR_GRID_ROWS; r++) {
+    for (int c = 0; c < AVATAR_GRID_COLS; c++) {
+      int idx = r * AVATAR_GRID_COLS + c;
+
+      // A シート (目開け)
+      _canvasA[idx] = new M5Canvas(&M5.Display);
+      _canvasA[idx]->setColorDepth(16);
+      _canvasA[idx]->createSprite(_imgWidth, _imgHeight);
+      String pathA = String("/A_r") + r + "c" + c + ".png";
+      if (_canvasA[idx]->drawPngFile(LittleFS, pathA.c_str())) {
+        loaded++;
+      } else {
+        Serial.printf("[Avatar] Missing: %s\n", pathA.c_str());
+        _canvasA[idx]->fillSprite(TFT_BLACK);
+      }
+
+      // D シート (目閉じ)
+      _canvasD[idx] = new M5Canvas(&M5.Display);
+      _canvasD[idx]->setColorDepth(16);
+      _canvasD[idx]->createSprite(_imgWidth, _imgHeight);
+      String pathD = String("/D_r") + r + "c" + c + ".png";
+      if (_canvasD[idx]->drawPngFile(LittleFS, pathD.c_str())) {
+        loaded++;
+      } else {
+        Serial.printf("[Avatar] Missing: %s\n", pathD.c_str());
+        _canvasD[idx]->fillSprite(TFT_BLACK);
+      }
+    }
+  }
+  Serial.printf("[Avatar] initGrid done: %d/50 loaded, PSRAM free=%d\n", loaded, ESP.getFreePsram());
+
+  _running = true;
+  xTaskCreatePinnedToCore(drawTaskGrid, "AvatarGrid", 4096, this, 1, &_taskHandle, 1);
+  return true;
+}
+
+void M5GuruguruAvatar::setPose(int row, int col) {
+  if (row < 0) row = 0; else if (row >= AVATAR_GRID_ROWS) row = AVATAR_GRID_ROWS - 1;
+  if (col < 0) col = 0; else if (col >= AVATAR_GRID_COLS) col = AVATAR_GRID_COLS - 1;
+  _currentRow = row;
+  _currentCol = col;
+}
+
+void M5GuruguruAvatar::setBlink(bool eyesClosed) {
+  _blink = eyesClosed;
+}
+
+void M5GuruguruAvatar::trackFaceGrid(int touchX, int touchY) {
+  int w = M5.Display.width();
+  int h = M5.Display.height();
+  if (w <= 0 || h <= 0) return;
+  int col = (touchX * AVATAR_GRID_COLS) / w;
+  int row = (touchY * AVATAR_GRID_ROWS) / h;
+  setPose(row, col);
+}
+
+void M5GuruguruAvatar::updateFromYawPitch(float yawDeg, float pitchDeg, float maxRange) {
+  // -maxRange/2 ..+maxRange/2 を 0..4 にスケール (中央 maxRange/2 = col 2)
+  float halfRange = maxRange * 0.5f;
+  float yawNorm = (yawDeg + halfRange) / maxRange;   // 0..1
+  float pitchNorm = (pitchDeg + halfRange) / maxRange;
+  int col = (int)roundf(yawNorm * (AVATAR_GRID_COLS - 1));
+  int row = (int)roundf(pitchNorm * (AVATAR_GRID_ROWS - 1));
+  setPose(row, col);
+}
+
+// ── teardown ─────────────────────────────────────────────────────
 void M5GuruguruAvatar::end() {
   _running = false;
   if (_taskHandle) {
@@ -43,8 +129,11 @@ void M5GuruguruAvatar::end() {
     _taskHandle = nullptr;
   }
   for (int i = 0; i < AVATAR_NUM_DIR; i++) {
-    delete _canvas[i];
-    _canvas[i] = nullptr;
+    delete _canvas[i];  _canvas[i] = nullptr;
+  }
+  for (int i = 0; i < AVATAR_GRID_CELLS; i++) {
+    delete _canvasA[i]; _canvasA[i] = nullptr;
+    delete _canvasD[i]; _canvasD[i] = nullptr;
   }
 }
 
@@ -52,8 +141,8 @@ M5GuruguruAvatar::~M5GuruguruAvatar() {
   end();
 }
 
-// static
-void M5GuruguruAvatar::drawTask(void* arg) {
+// ── draw tasks ───────────────────────────────────────────────────
+void M5GuruguruAvatar::drawTask9(void* arg) {
   auto* self = static_cast<M5GuruguruAvatar*>(arg);
   while (self->_running) {
     float zx = (float)M5.Display.width()  / self->_imgWidth;
@@ -65,6 +154,27 @@ void M5GuruguruAvatar::drawTask(void* arg) {
       0.0f, zx, zy
     );
     M5.Display.endWrite();
+    vTaskDelay(pdMS_TO_TICKS(33));  // ~30 fps
+  }
+  vTaskDelete(nullptr);
+}
+
+void M5GuruguruAvatar::drawTaskGrid(void* arg) {
+  auto* self = static_cast<M5GuruguruAvatar*>(arg);
+  while (self->_running) {
+    int idx = self->_currentRow * AVATAR_GRID_COLS + self->_currentCol;
+    M5Canvas* sprite = self->_blink ? self->_canvasD[idx] : self->_canvasA[idx];
+    if (sprite) {
+      float zx = (float)M5.Display.width()  / self->_imgWidth;
+      float zy = (float)M5.Display.height() / self->_imgHeight;
+      M5.Display.startWrite();
+      sprite->pushRotateZoom(
+        M5.Display.width()  / 2,
+        M5.Display.height() / 2,
+        0.0f, zx, zy
+      );
+      M5.Display.endWrite();
+    }
     vTaskDelay(pdMS_TO_TICKS(33));  // ~30 fps
   }
   vTaskDelete(nullptr);
