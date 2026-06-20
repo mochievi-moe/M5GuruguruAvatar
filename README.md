@@ -8,6 +8,8 @@ Inspired by @rotejin's tomari-guruguru project.
 
 https://x.com/nananauno/status/2067257510378274823
 
+Grid mode demo (this fork): https://x.com/mochi_mochi_lab/status/2068354780611944791
+
 ## Requirements
 - M5Unified
 
